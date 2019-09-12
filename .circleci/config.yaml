@@ -1,0 +1,332 @@
+defaults: &defaults
+    docker:
+      - image: circleci/node:10
+    working_directory: ~/pg-crm
+
+version: 2
+jobs:
+  test:
+    <<: *defaults
+    steps:
+      - checkout
+      - restore_cache:
+          name: Restore Yarn Package Cache
+          key: v1-pg-crm-{{ checksum "yarn.lock" }}
+      - run:
+          name: Setup SFDX environment variables
+          command: |
+            echo "export SFDX_DOMAIN_RETRY=300" >> $BASH_ENV
+      - run:
+          name: Install dependencies
+          command: |
+            yarn install --frozen-lockfile
+      - save_cache:
+          name: Save Yarn Package Cache
+          key: v1-pg-crm-{{ checksum "yarn.lock" }}
+          paths:
+            - ./node_modules
+            - ~/.cache/yarn
+      - run:
+          name: Install managed static resources
+          command: yarn run copy-resources
+      - run:
+          name: Lint lightning components
+          command: yarn lint
+      - run:
+          name: Authenticate with Dev Hub for Scratch Org creation
+          command: |
+            npx sfdx force:auth:jwt:grant --clientid ${DEVHUB_CONSUMER_KEY} --username ${DEVHUB_USERNAME} --jwtkeyfile ${JWT_KEY_FILE} --setdefaultdevhubusername -a ${DEVHUB_ALIAS}
+      - run:
+          name: Create Scratch Org
+          command: |
+            npx sfdx force:org:create -v ${DEVHUB_ALIAS} -s -f /home/circleci/pg-crm/config/project-scratch-def.json -a ciorg -d 1 --wait 7
+      - run:
+          name: Validate Scratch Org creation
+          command: npx sfdx force:org:display -u ciorg
+      - run:
+          name: Install Lightning Testing Service in Scratch Org
+          command: npx sfdx force:lightning:test:install
+      - run:
+          name: Push code changes
+          command: npx sfdx force:source:push -f -u ciorg
+      - run:
+          name: Execute apex tests
+          command: npx sfdx force:apex:test:run -c -u ciorg -r human -d . --wait 10
+      - run:
+          name: Check Code Coverage >= 80%
+          command: |
+            TEST_RUN_ID=$(<test-run-id.txt)
+            COVERAGE=$(cat test-result-$TEST_RUN_ID.json | jq ".summary.orgWideCoverage" | sed -e 's/["%]//g')
+            echo $COVERAGE
+            if [ ! "$COVERAGE" -ge 80 ]; then exit 1; fi
+      - run:
+          name: Cleanup Scratch Org
+          command: npx sfdx force:org:delete -u ciorg -p
+          when: always
+
+  deploy-dev:
+    <<: *defaults
+    steps:
+      - checkout
+      - restore_cache:
+          name: Restore Yarn Package Cache
+          key: v1-pg-crm-{{ checksum "yarn.lock" }}
+      - run:
+          name: Install dependencies
+          command: yarn install --frozen-lockfile
+      - run:
+          name: Install managed static resources
+          command: yarn run copy-resources
+      - run:
+          name: Inject deployment configuration
+          command: cp -f ./config/dev/Config.json ./force-app/main/default/staticresources/Config.json
+      - run:
+          name: Inject configs
+          command: bash ./.circleci/pipeline/inject-configs.sh dev
+      - run:
+          name: Override environment specific metadata
+          command: cp -rf ./force-app-overrides/dev/. ./force-app/
+      - run:
+          name: Convert to metadata for deployment
+          command: |
+            mkdir dist
+            npx sfdx force:source:convert -d dist
+      - run:
+          name: Authenticate with Sandbox
+          command: |
+            npx sfdx force:auth:jwt:grant --clientid ${DEVPRO_CONSUMER_KEY} --username ${DEVPRO_USERNAME} --jwtkeyfile ${JWT_KEY_FILE} -a ${DEVPRO_ALIAS} -r ${SALESFORCE_TEST_URL}
+      - run:
+          name: Run pre-deployment migration scripts
+          command: |
+            bash ./.circleci/pipeline/run-migrations.sh pre ${DEVPRO_ALIAS}
+      - run:
+          name: Deploy to Sandbox
+          command: npx sfdx force:mdapi:deploy -d dist -u ${DEVPRO_ALIAS} -w 100 --testlevel RunLocalTests
+      - run:
+          name: Install ConvergeOne CTI Packages
+          command: |
+            npx sfdx force:package:install --package "${C1_CONFIG_VERSION_ID}" --targetusername ${DEVPRO_ALIAS} --wait 10 --publishwait 10
+            npx sfdx force:package:install --package "${C1_LIGHTNING_FIELDS_VERSION_ID}" --targetusername ${DEVPRO_ALIAS} --wait 10 --publishwait 10
+      - run:
+          name: Run post-deployment migration scripts
+          command: |
+            bash ./.circleci/pipeline/run-migrations.sh post ${DEVPRO_ALIAS}
+
+  deploy-qa:
+    <<: *defaults
+    steps:
+      - checkout
+      - restore_cache:
+          name: Restore Yarn Package Cache
+          key: v1-pg-crm-{{ checksum "yarn.lock" }}
+      - run:
+          name: Install dependencies
+          command: yarn install --frozen-lockfile
+      - run:
+          name: Install managed static resources
+          command: yarn run copy-resources
+      - run:
+          name: Inject deployment configuration
+          command: cp -f ./config/qa/Config.json ./force-app/main/default/staticresources/Config.json
+      - run:
+          name: Inject configs
+          command: bash ./.circleci/pipeline/inject-configs.sh qa
+      - run:
+          name: Override environment specific metadata
+          command: cp -rf ./force-app-overrides/qa/. ./force-app/
+      - run:
+          name: Inject TSP secrets
+          command: bash ./.circleci/pipeline/inject-client-secrets.sh qa TSP
+      - run:
+          name: Inject CT secrets
+          command: bash ./.circleci/pipeline/inject-client-secrets.sh qa CT
+      - run:
+          name: Inject CVS secrets
+          command: bash ./.circleci/pipeline/inject-client-secrets.sh qa CVS
+      - run:
+          name: Convert to metadata for deployment
+          command: |
+            mkdir dist
+            npx sfdx force:source:convert -d dist
+      - run:
+          name: Authenticate with Sandbox
+          command: |
+            npx sfdx force:auth:jwt:grant --clientid ${DEVQA_CONSUMER_KEY} --username ${DEVQA_USERNAME} --jwtkeyfile ${JWT_KEY_FILE} -a ${DEVQA_ALIAS} -r ${SALESFORCE_TEST_URL}
+      - run:
+          name: Run pre-deployment migration scripts
+          command: |
+            bash ./.circleci/pipeline/run-migrations.sh pre ${DEVQA_ALIAS}
+      - run:
+          name: Deploy to Sandbox
+          command: npx sfdx force:mdapi:deploy -d dist -u ${DEVQA_ALIAS} -w 100 --testlevel RunLocalTests
+      - run:
+          name: Install ConvergeOne CTI Packages
+          command: |
+            npx sfdx force:package:install --package "${C1_CONFIG_VERSION_ID}" --targetusername ${DEVQA_ALIAS} --wait 10 --publishwait 10
+            npx sfdx force:package:install --package "${C1_LIGHTNING_FIELDS_VERSION_ID}" --targetusername ${DEVQA_ALIAS} --wait 10 --publishwait 10
+      - run:
+          name: Run post-deployment migration scripts
+          command: |
+            bash ./.circleci/pipeline/run-migrations.sh post ${DEVQA_ALIAS}
+
+  deploy-stg:
+    <<: *defaults
+    steps:
+      - checkout
+      - restore_cache:
+          name: Restore Yarn Package Cache
+          key: v1-pg-crm-{{ checksum "yarn.lock" }}
+      - run:
+          name: Install dependencies
+          command: yarn install --frozen-lockfile
+      - run:
+          name: Install managed static resources
+          command: yarn run copy-resources
+      - run:
+          name: Inject deployment configuration
+          command: cp -f ./config/stg/Config.json ./force-app/main/default/staticresources/Config.json
+      - run:
+          name: Inject configs
+          command: bash ./.circleci/pipeline/inject-configs.sh stg
+      - run:
+          name: Override environment specific metadata
+          command: cp -rf ./force-app-overrides/stg/. ./force-app/
+      - run:
+          name: Inject TSP secrets
+          command: bash ./.circleci/pipeline/inject-client-secrets.sh stg TSP
+      - run:
+          name: Inject CT secrets
+          command: bash ./.circleci/pipeline/inject-client-secrets.sh stg CT
+      - run:
+          name: Inject CVS secrets
+          command: bash ./.circleci/pipeline/inject-client-secrets.sh stg CVS
+      - run:
+          name: Convert to metadata for deployment
+          command: |
+            mkdir dist
+            npx sfdx force:source:convert -d dist
+      - run:
+          name: Authenticate with Sandbox
+          command: |
+            npx sfdx force:auth:jwt:grant --clientid ${STG_CONSUMER_KEY} --username ${STG_USERNAME} --jwtkeyfile ${JWT_KEY_FILE} -a ${STG_ALIAS} -r ${SALESFORCE_TEST_URL}
+      - run:
+          name: Run pre-deployment migration scripts
+          command: |
+            bash ./.circleci/pipeline/run-migrations.sh pre ${STG_ALIAS}
+      - run:
+          name: Deploy to Sandbox
+          command: npx sfdx force:mdapi:deploy -d dist -u ${STG_ALIAS} -w 100 --testlevel RunLocalTests
+      - run:
+          name: Install ConvergeOne CTI Packages
+          command: |
+            npx sfdx force:package:install --package "${C1_CONFIG_VERSION_ID}" --targetusername ${STG_ALIAS} --wait 10 --publishwait 10
+            npx sfdx force:package:install --package "${C1_LIGHTNING_FIELDS_VERSION_ID}" --targetusername ${STG_ALIAS} --wait 10 --publishwait 10
+      - run:
+          name: Run post-deployment migration scripts
+          command: |
+            bash ./.circleci/pipeline/run-migrations.sh post ${STG_ALIAS}
+
+  deploy-prd:
+    <<: *defaults
+    steps:
+      - checkout
+      - restore_cache:
+          name: Restore Yarn Package Cache
+          key: v1-pg-crm-{{ checksum "yarn.lock" }}
+      - run:
+          name: Install dependencies
+          command: |
+            yarn install --frozen-lockfile
+            sudo apt-get update
+            sudo apt-get install jq gawk
+      - run:
+          name: Install managed static resources
+          command: yarn run copy-resources
+      - run:
+          name: Inject deployment configuration
+          command: cp -f ./config/prd/Config.json ./force-app/main/default/staticresources/Config.json
+      - run:
+          name: Inject configs
+          command: bash ./.circleci/pipeline/inject-configs.sh prd
+      - run:
+          name: Inject TSP secrets
+          command: bash ./.circleci/pipeline/inject-client-secrets.sh prd TSP
+      - run:
+          name: Inject CT secrets
+          command: bash ./.circleci/pipeline/inject-client-secrets.sh prd CT
+      - run:
+          name: Inject CVS secrets
+          command: bash ./.circleci/pipeline/inject-client-secrets.sh prd CVS
+      - run:
+          name: Convert to metadata for deployment
+          command: |
+            mkdir dist
+            npx sfdx force:source:convert -d dist
+      - run:
+          name: Authenticate with Sandbox
+          command: |
+            npx sfdx force:auth:jwt:grant --clientid ${PROD_CONSUMER_KEY} --username ${PROD_USERNAME} --jwtkeyfile ${JWT_KEY_FILE} -a ${PROD_ALIAS} -r ${PROD_INSTANCE_URL}
+      - run:
+          name: Run pre-deployment migration scripts
+          command: |
+            bash ./.circleci/pipeline/run-migrations.sh pre ${PROD_ALIAS}
+      - run:
+          name: Deploy to Sandbox
+          command: npx sfdx force:mdapi:deploy -d dist -u ${PROD_ALIAS} -w 100
+      - run:
+          name: Install ConvergeOne CTI Packages
+          command: |
+            npx sfdx force:package:install --package "${C1_CONFIG_VERSION_ID}" --targetusername ${PROD_ALIAS} --wait 10 --publishwait 10
+            npx sfdx force:package:install --package "${C1_LIGHTNING_FIELDS_VERSION_ID}" --targetusername ${PROD_ALIAS} --wait 10 --publishwait 10
+      - run:
+          name: Run post-deployment migration scripts
+          command: |
+            bash ./.circleci/pipeline/run-migrations.sh post ${PROD_ALIAS}
+
+workflows:
+  version: 2
+  test-deploy:
+    jobs:
+      - test:
+          filters:
+            branches:
+              ignore:
+                - /sprint-\d+$/
+                - develop
+                - /release\/.*/
+                - master
+      - deploy-dev:
+          filters:
+            branches:
+              only:
+                - /sprint-\d+$/
+      - deploy-qa:
+          filters:
+            branches:
+              only:
+                - develop
+      - deploy-stg:
+          filters:
+            branches:
+              only:
+                - /release\/.*/
+      - deploy-prd:
+          filters:
+            branches:
+              only:
+                - master
+Quicklinks
+Profiles Chamber
+Quick Console
+Home
+Quick Query
+Execute Anonymous
+Sobject fields
+Quick ORG Describe
+Replace API Names
+Convert SF Id
+Login As...
+Games
+Options
+Hide
+The Welkin Suite’s fast, one dashboard approach for configuring Salesforce Orgs
